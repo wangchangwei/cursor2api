@@ -29,12 +29,12 @@ cursor_model: "anthropic/claude-sonnet-4.6"
 
 # ==================== Thinking 开关（最高优先级） ====================
 # 控制是否向 Cursor 发送 thinking 请求，优先级高于客户端传入的 thinking 参数
-# 设为 true：始终启用 thinking（默认行为，让模型先思考再回答）
-# 设为 false：强制关闭 thinking（即使客户端请求了 thinking 也不启用）
-# 不配置此项时：跟随客户端请求，proxy 默认自动补上 enabled
+# 设为 true: 强制启用 thinking（即使客户端没请求也注入）
+# 设为 false: 强制关闭 thinking（即使客户端请求了 thinking 也不启用）
+# 不配置此项时: 跟随客户端请求（Anthropic API 看 thinking 参数，OpenAI API 看模型名/reasoning_effort）
 # 环境变量: THINKING_ENABLED=true|false
-thinking:
-  enabled: false
+# thinking:
+#   enabled: false
 
 # ==================== 历史消息压缩配置 ====================
 # 对话过长时自动压缩早期消息，释放输出空间，防止 Cursor 上下文溢出

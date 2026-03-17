@@ -70,7 +70,7 @@ cp config.yaml.example config.yaml
 | `port` | 服务端口 | `3010` |
 | `auth_tokens` | API 鉴权 token 列表（公网部署推荐配置） | 不配置则全部放行 |
 | `cursor_model` | 使用的模型 | `anthropic/claude-sonnet-4.6` |
-| `thinking.enabled` | Thinking 开关（最高优先级） | `true` |
+| `thinking.enabled` | Thinking 开关（最高优先级） | 跟随客户端 |
 | `compression.enabled` | 压缩开关 | `true` |
 | `compression.level` | 压缩级别 1-3 | `2` (中等) |
 | `proxy` | 全局代理（可选） | 不配置 |

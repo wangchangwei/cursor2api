@@ -488,15 +488,17 @@ export async function handleMessages(req: Request, res: Response): Promise<void>
         // - adaptive: Claude Code，需要密码学 signature 验证，无法伪造 → 保留标签在正文中
         const thinkingConfig = getConfig().thinking;
         // ★ config.yaml thinking 开关优先级最高
-        if (thinkingConfig && !thinkingConfig.enabled) {
-            // 配置强制关闭 thinking → 移除 thinking 参数
-            delete body.thinking;
+        // enabled=true: 强制注入 thinking（即使客户端没请求）
+        // enabled=false: 强制关闭 thinking
+        // 未配置: 跟随客户端请求（不自动补上）
+        if (thinkingConfig) {
+            if (!thinkingConfig.enabled) {
+                delete body.thinking;
+            } else if (!body.thinking) {
+                body.thinking = { type: 'enabled' };
+            }
         }
         const clientRequestedThinking = body.thinking?.type === 'enabled';
-        // ★ Thinking 默认启用：当配置未禁用时，Claude Code 等客户端可能不传 thinking 参数，proxy 层自动补上
-        if (!body.thinking && (!thinkingConfig || thinkingConfig.enabled)) {
-            body.thinking = { type: 'enabled' };
-        }
         const cursorReq = await convertToCursorRequest(body);
         log.endPhase();
         log.recordCursorRequest(cursorReq);

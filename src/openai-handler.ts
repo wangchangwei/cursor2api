@@ -189,8 +189,18 @@ function convertToAnthropicRequest(body: OpenAIChatRequest): AnthropicRequest {
             ? (Array.isArray(body.stop) ? body.stop : [body.stop])
             : undefined,
         // ★ Thinking 开关：config.yaml 优先级最高
-        // 当配置未禁用时，默认启用 thinking 确保 Claude Code 等 OpenAI 格式客户端也能获得 thinking 内容
-        ...((!getConfig().thinking || getConfig().thinking!.enabled) ? { thinking: { type: 'enabled' as const } } : {}),
+        // enabled=true: 强制注入 thinking（即使客户端没请求）
+        // enabled=false: 强制关闭 thinking
+        // 未配置: 跟随客户端（模型名含 'thinking' 或传了 reasoning_effort 才注入）
+        ...(() => {
+            const tc = getConfig().thinking;
+            if (tc && tc.enabled) return { thinking: { type: 'enabled' as const } };
+            if (tc && !tc.enabled) return {};
+            // 未配置 → 跟随客户端信号
+            const modelHint = body.model?.toLowerCase().includes('thinking');
+            const effortHint = !!(body as unknown as Record<string, unknown>).reasoning_effort;
+            return (modelHint || effortHint) ? { thinking: { type: 'enabled' as const } } : {};
+        })(),
     };
 }
 

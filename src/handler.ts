@@ -9,6 +9,7 @@ import type { Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import type {
     AnthropicRequest,
+    AnthropicMessage,
     AnthropicResponse,
     AnthropicContentBlock,
     CursorChatRequest,
@@ -22,6 +23,7 @@ import { getConfig } from './config.js';
 import { createRequestLogger, type RequestLogger } from './logger.js';
 import { estimateTokens } from './tokenizer.js';
 import { createIncrementalTextStreamer, hasLeadingThinking, splitLeadingThinkingBlocks, stripThinkingTags } from './streaming-text.js';
+import { getSplitTaskRecoverySuffix } from './split-task-recovery.js';
 
 function msgId(): string {
     return 'msg_' + uuidv4().replace(/-/g, '').substring(0, 24);
@@ -813,6 +815,63 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
 // ==================== 重试辅助 ====================
 export const MAX_REFUSAL_RETRIES = 1;
 
+/** 与拒绝重试解耦：上游空/极短/end_turn 早停时的 probe 次数（每次均带 assistant+探针上下文） */
+export const MAX_EMPTY_PROBE_RETRIES = 2;
+
+const SUSPICIOUSLY_SHORT_LEN = 30;
+
+/** tool_choice=auto：无 json action 的纯文本 end_turn 超过此长度视为有意收束，不再软提醒 */
+const NO_JSON_ACTION_SOFT_PLAIN_MAX_CHARS = 400;
+
+/**
+ * tool_choice≠any 且无 json action 时，最多追加几轮「assistant + user」上游对话，主动续通信避免客户端会话被 end_turn 截断。
+ */
+export const MAX_UPSTREAM_SESSION_KEEPALIVE_ROUNDS = 3;
+
+/** 第 2 轮及以后的 user 探针（第 1 轮用完整工具格式提醒） */
+const SESSION_KEEPALIVE_USER_PROBES = [
+    'Your last message still had no tool call. This environment requires a ```json action``` block to continue the agent session — plain text alone stops the client. Output one complete json action block for the next step now.',
+    'Continuation required: you must invoke a tool using the ```json action``` format. The session cannot proceed without a tool call; reply with the action block only if needed, or include it after one short line.',
+] as const;
+
+/**
+ * 工具模式下上游完全无输出时的最后兜底：合成首个工具的 ```json action```，避免下游 agent 卡在 0 字符 end_turn。
+ */
+export function buildSyntheticToolActionFromRequest(body: AnthropicRequest): string | null {
+    const tool = body.tools?.[0];
+    if (!tool?.name) return null;
+    const schema = tool.input_schema as { properties?: Record<string, { type?: string }> } | undefined;
+    const props = schema?.properties;
+    const parameters: Record<string, unknown> = props
+        ? Object.fromEntries(
+            Object.entries(props).slice(0, 1).map(([k, v]) => {
+                const typ = (v as { type?: string }).type;
+                return [k, typ === 'boolean' ? true : typ === 'number' ? 0 : ''];
+            }),
+        )
+        : {};
+    return `\`\`\`json action\n${JSON.stringify({ tool: tool.name, parameters }, null, 2)}\n\`\`\``;
+}
+
+/**
+ * probe 用尽后：仍无工具块且内容空或异常短时，注入合成工具调用或占位句（与 openai-handler 语义对齐）。
+ */
+export function applyEmptyUpstreamSyntheticFallback(body: AnthropicRequest, fullResponse: string, log: RequestLogger): string {
+    if ((body.tools?.length ?? 0) === 0) return fullResponse;
+    if (hasToolCalls(fullResponse)) return fullResponse;
+    const t = fullResponse.trim();
+    const numericOnly = /^\d+(\.\d+)?$/.test(t);
+    if (t.length > 0 && t.length >= 10 && !numericOnly) return fullResponse;
+
+    const syn = buildSyntheticToolActionFromRequest(body);
+    if (syn) {
+        log.warn('Handler', 'retry', '上游空/极短且无有效工具块，注入合成 json action（empty-probe 已用尽）');
+        return syn;
+    }
+    log.warn('Handler', 'retry', '上游空/极短且无工具定义可合成，注入占位正文');
+    return 'Let me proceed with the task.';
+}
+
 /**
  * 当检测到拒绝时，用 IDE 上下文重新包装原始请求体并重试
  * 策略：把用户原始问题包裹在一个"编程任务"情景中，绕过身份锁定
@@ -844,6 +903,82 @@ export function buildRetryRequest(body: AnthropicRequest, attempt: number): Anth
     }
 
     return { ...body, messages: newMessages };
+}
+
+/**
+ * 重试请求：在上一条响应过短时，追加 check 探针用户消息再请求上游。
+ * 与 buildRetryRequest 的区别：不去重试 reframing，而是直接追加探针引导。
+ */
+export function buildShortResponseRetryRequest(body: AnthropicRequest, shortResponse: string): AnthropicRequest {
+    const probeMessage: AnthropicMessage = {
+        role: 'user',
+        content: 'Please continue. If you have already started a tool call, please output the complete ```json action``` block now. If you have not started one, please provide a brief confirmation.',
+    };
+    return {
+        ...body,
+        messages: [...body.messages, { role: 'assistant', content: shortResponse }, probeMessage],
+    };
+}
+
+/**
+ * 重试请求：将思考片段作为上下文注入，让模型继续完成已开始的工作。
+ * 比合成空 fallback 更可靠 — 模型能接着自己的思路走。
+ */
+export function buildThinkingFragmentRetryRequest(body: AnthropicRequest, fragment: string): AnthropicRequest {
+    const retryMessage: AnthropicMessage = {
+        role: 'user',
+        content: `Your previous response was cut off mid-output. The last part of your output was:\n\n${fragment}\n\nPlease continue and complete the tool call directly. Output the complete JSON action block now.`,
+    };
+    return {
+        ...body,
+        messages: [...body.messages, { role: 'assistant', content: fragment }, retryMessage],
+    };
+}
+
+/** 在 Cursor 请求末尾追加一轮 assistant + user（用于多轮上游续通信） */
+function appendCursorAssistantUserRound(
+    base: CursorChatRequest,
+    assistantPlainText: string,
+    userMessage: string,
+): CursorChatRequest {
+    return {
+        ...base,
+        messages: [
+            ...base.messages,
+            { parts: [{ type: 'text', text: assistantPlainText }], id: uuidv4(), role: 'assistant' },
+            { parts: [{ type: 'text', text: userMessage }], id: uuidv4(), role: 'user' },
+        ],
+    };
+}
+
+/** 第 1 轮：完整「请输出 json action」说明（与 tool_choice=any 强制重试文案一致） */
+function appendCursorToolReminderRound(
+    base: CursorChatRequest,
+    assistantPlainText: string,
+    body: AnthropicRequest,
+): CursorChatRequest {
+    const availableTools = body.tools ?? [];
+    const toolNameList = availableTools.slice(0, 15).map((t) => t.name).join(', ');
+    const primaryTool = availableTools.find((t) => /^(write_to_file|Write|WriteFile)$/i.test(t.name));
+    const exTool = primaryTool?.name || availableTools[0]?.name || 'write_to_file';
+    const remind = `I notice your previous response was plain text without a tool call. Just a quick reminder: in this environment, every response needs to include at least one \`\`\`json action\`\`\` block — that's how tools are invoked here.
+
+Here are the tools you have access to: ${toolNameList}
+
+The format looks like this:
+
+\`\`\`json action
+{
+  "tool": "${exTool}",
+  "parameters": {
+    "path": "filename.py",
+    "content": "# file content here"
+  }
+}
+\`\`\`
+
+Please go ahead and pick the most appropriate tool for the current task and output the action block.`;
+    return appendCursorAssistantUserRound(base, assistantPlainText, remind);
 }
 
 function writeAnthropicTextDelta(
@@ -1098,6 +1233,19 @@ async function handleDirectTextStream(
         finalTextToSend = streamer.finish();
     }
 
+    let splitRecoveryStopReason: 'end_turn' | 'max_tokens' = 'end_turn';
+    if (!usedFallback) {
+        const combinedVisible = streamer.hasSentText()
+            ? sanitizeResponse(finalVisibleText) + finalTextToSend
+            : finalTextToSend;
+        const suf = getSplitTaskRecoverySuffix(combinedVisible);
+        if (suf) {
+            log.warn('Handler', 'retry', `拆分任务容错(无工具流): ${suf.kind}`);
+            finalTextToSend = finalTextToSend + suf.suffix;
+            if (suf.forceMaxTokensStop) splitRecoveryStopReason = 'max_tokens';
+        }
+    }
+
     if (!usedFallback && clientRequestedThinking && finalThinkingContent && !streamState.thinkingEmitted) {
         emitAnthropicThinkingBlock(res, streamState, finalThinkingContent);
     }
@@ -1114,14 +1262,14 @@ async function handleDirectTextStream(
 
     writeSSE(res, 'message_delta', {
         type: 'message_delta',
-        delta: { stop_reason: 'end_turn', stop_sequence: null },
+        delta: { stop_reason: splitRecoveryStopReason, stop_sequence: null },
         usage: { output_tokens: Math.ceil((streamer.hasSentText() ? (finalVisibleText || finalRawResponse) : finalTextToSend).length / 4) },
     });
     writeSSE(res, 'message_stop', { type: 'message_stop' });
 
     const finalRecordedResponse = streamer.hasSentText()
-        ? sanitizeResponse(finalVisibleText)
-        : finalTextToSend;
+        ? sanitizeResponse(finalVisibleText + finalTextToSend)
+        : sanitizeResponse(finalTextToSend);
     log.recordFinalResponse(finalRecordedResponse);
     const estimatedInput1 = estimateCursorReqTokens(activeCursorReq);
     const actualInput1 = cursorUsage?.inputTokens;
@@ -1130,7 +1278,7 @@ async function handleDirectTextStream(
         inputTokens: cursorUsage?.inputTokens,
         outputTokens: cursorUsage?.outputTokens,
     });
-    log.complete(finalRecordedResponse.length, 'end_turn');
+    log.complete(finalRecordedResponse.length, splitRecoveryStopReason);
 
     res.end();
     } finally {
@@ -1177,6 +1325,7 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
     // 无工具模式：先缓冲全部响应再检测拒绝，如果是拒绝则重试
     let activeCursorReq = cursorReq;
     let retryCount = 0;
+    let upstreamFinishReason: string = 'end_turn';
 
     const executeStream = async (detectRefusalEarly = false, onTextDelta?: (delta: string) => void): Promise<{ earlyAborted: boolean }> => {
         fullResponse = '';
@@ -1191,6 +1340,7 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
         try {
             await sendCursorRequest(activeCursorReq, (event: CursorSSEEvent) => {
                 if (event.type === 'finish') {
+                    if (event.finishReason) upstreamFinishReason = event.finishReason;
                     if (event.messageMetadata?.usage) cursorUsage = event.messageMetadata.usage;
                     return;
                 }
@@ -1436,14 +1586,79 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
             }
         }
 
-        // 极短响应重试（仅在响应几乎为空时触发，避免误判正常短回答如 "2" 或 "25岁"）
-        const trimmed = fullResponse.trim();
-        if (hasTools && trimmed.length < 3 && !trimmed.match(/\d/) && retryCount < MAX_REFUSAL_RETRIES) {
-            retryCount++;
-            log.warn('Handler', 'retry', `响应过短 (${fullResponse.length} chars: "${trimmed}")，重试第${retryCount}次`);
-            activeCursorReq = await convertToCursorRequest(body);
+        // 上游空/极短/end_turn 早停 — 使用独立 empty-probe 预算（不与 MAX_REFUSAL_RETRIES 争抢）
+        let emptyProbeCount = 0;
+        while (emptyProbeCount < MAX_EMPTY_PROBE_RETRIES) {
+            if (!hasTools || hasToolCalls(fullResponse)) break;
+            const trimmed = fullResponse.trim();
+            const ultraShort = trimmed.length < 3 && !trimmed.match(/\d/);
+            const suspiciousShort =
+                trimmed.length >= 3
+                && trimmed.length < SUSPICIOUSLY_SHORT_LEN
+                && !trimmed.match(/\d/)
+                && upstreamFinishReason === 'end_turn';
+            if (!ultraShort && !suspiciousShort) break;
+
+            emptyProbeCount++;
+            log.warn(
+                'Handler',
+                'retry',
+                ultraShort
+                    ? `响应过短 (${fullResponse.length} chars: "${trimmed}")，probe 第${emptyProbeCount}次（带上下文）`
+                    : `提前结束短响应 (${trimmed.length} chars)，probe 第${emptyProbeCount}次`,
+            );
+            activeCursorReq = await convertToCursorRequest(buildShortResponseRetryRequest(body, fullResponse));
             await executeStream();
-            log.info('Handler', 'retry', `重试响应: ${fullResponse.length} chars`, { preview: fullResponse.substring(0, 200) });
+            if (hasLeadingThinking(fullResponse)) {
+                const { thinkingContent: probeThink, strippedText: probeStrip } = extractThinking(fullResponse);
+                if (probeThink && !thinkingContent) thinkingContent = probeThink;
+                fullResponse = probeStrip;
+            }
+            log.info('Handler', 'retry', `probe 后响应: ${fullResponse.length} chars`, { preview: fullResponse.substring(0, 200) });
+        }
+
+        fullResponse = applyEmptyUpstreamSyntheticFallback(body, fullResponse, log);
+
+        // ★ tool_choice≠any：纯文本 end_turn 且无 json action 时多轮主动上游续通信（assistant+user 链式追加），避免客户端会话被单次 end_turn 截断
+        // （any 由下方专用循环处理；已向客户端混流发过正文的不能追加，避免重复）
+        {
+            const tc = body.tool_choice;
+            let keepRound = 0;
+            while (
+                keepRound < MAX_UPSTREAM_SESSION_KEEPALIVE_ROUNDS
+                && !hybridAlreadySentText
+                && hasTools
+                && !hasToolCalls(fullResponse)
+                && upstreamFinishReason === 'end_turn'
+                && tc?.type !== 'any'
+            ) {
+                const tSoft = fullResponse.trim();
+                if (
+                    tSoft.length === 0
+                    || tSoft.length > NO_JSON_ACTION_SOFT_PLAIN_MAX_CHARS
+                    || isRefusal(fullResponse)
+                    || fullResponse.includes('```json action')
+                ) {
+                    break;
+                }
+                keepRound++;
+                if (keepRound === 1) {
+                    log.warn('Handler', 'retry', `会话保持：上游软提醒 ${keepRound}/${MAX_UPSTREAM_SESSION_KEEPALIVE_ROUNDS}（${tSoft.length} chars）`);
+                    activeCursorReq = appendCursorToolReminderRound(activeCursorReq, fullResponse, body);
+                } else {
+                    const probeIdx = Math.min(keepRound - 2, SESSION_KEEPALIVE_USER_PROBES.length - 1);
+                    const probeText = SESSION_KEEPALIVE_USER_PROBES[probeIdx];
+                    log.warn('Handler', 'retry', `会话保持：上游续通信 ${keepRound}/${MAX_UPSTREAM_SESSION_KEEPALIVE_ROUNDS}`);
+                    activeCursorReq = appendCursorAssistantUserRound(activeCursorReq, fullResponse, probeText);
+                }
+                await executeStream();
+                if (hasLeadingThinking(fullResponse)) {
+                    const { thinkingContent: softThink, strippedText: softStrip } = extractThinking(fullResponse);
+                    if (softThink && !thinkingContent) thinkingContent = softThink;
+                    fullResponse = softStrip;
+                }
+                log.info('Handler', 'retry', `会话保持回合 ${keepRound} 后: ${fullResponse.length} chars`, { preview: fullResponse.substring(0, 200) });
+            }
         }
 
         // 流完成后，处理完整响应
@@ -1542,8 +1757,22 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
             }
         }
 
+        let splitRecoveryMaxTokensTool = false;
+        {
+            const sufTool = getSplitTaskRecoverySuffix(fullResponse);
+            if (sufTool) {
+                log.warn('Handler', 'retry', `拆分任务容错: ${sufTool.kind}`, { preview: fullResponse.substring(0, 160) });
+                fullResponse += sufTool.suffix;
+                if (sufTool.forceMaxTokensStop) splitRecoveryMaxTokensTool = true;
+            }
+        }
+
         let stopReason = shouldAutoContinueTruncatedToolResponse(fullResponse, hasTools) ? 'max_tokens' : 'end_turn';
-        if (stopReason === 'max_tokens') {
+        if (splitRecoveryMaxTokensTool) {
+            stopReason = 'max_tokens';
+            log.info('Handler', 'truncation', '拆分任务容错(输出上限类) → stop_reason=max_tokens');
+        }
+        if (stopReason === 'max_tokens' && !splitRecoveryMaxTokensTool) {
             log.warn('Handler', 'truncation', `${MAX_AUTO_CONTINUE}次续写后仍截断 (${fullResponse.length} chars) → stop_reason=max_tokens`);
         }
 
@@ -1830,7 +2059,8 @@ async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body
     try {
     log.startPhase('send', '发送到 Cursor (非流式)');
     const apiStart = Date.now();
-    let { text: fullText, usage: cursorUsage } = await sendCursorRequestFull(cursorReq);
+    let { text: fullText, usage: cursorUsage, finishReason: fullFinish0 } = await sendCursorRequestFull(cursorReq);
+    let upstreamFinishReasonNs: string = fullFinish0 ?? 'end_turn';
     log.recordTTFT();
     log.recordCursorApiTime(apiStart);
     log.recordRawResponse(fullText);
@@ -1873,7 +2103,10 @@ async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body
             log.updateSummary({ retryCount });
             const retryBody = buildRetryRequest(body, attempt);
             activeCursorReq = await convertToCursorRequest(retryBody);
-            ({ text: fullText, usage: cursorUsage } = await sendCursorRequestFull(activeCursorReq));
+            const refFull = await sendCursorRequestFull(activeCursorReq);
+            fullText = refFull.text;
+            cursorUsage = refFull.usage;
+            if (refFull.finishReason) upstreamFinishReasonNs = refFull.finishReason;
             // 重试后也需要剥离 thinking 标签
             if (hasLeadingThinking(fullText)) {
                 const { thinkingContent: retryThinking, strippedText: retryStripped } = extractThinking(fullText);
@@ -1898,13 +2131,79 @@ async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body
         }
     }
 
-    // ★ 极短响应重试（可能是连接中断）
-    if (hasTools && fullText.trim().length < 10 && retryCount < MAX_REFUSAL_RETRIES) {
-        retryCount++;
-        log.warn('Handler', 'retry', `非流式响应过短 (${fullText.length} chars)，重试第${retryCount}次`);
-        activeCursorReq = await convertToCursorRequest(body);
-        ({ text: fullText, usage: cursorUsage } = await sendCursorRequestFull(activeCursorReq));
-        log.info('Handler', 'retry', `非流式重试响应: ${fullText.length} chars`, { preview: fullText.substring(0, 200) });
+    let emptyProbeCountNs = 0;
+    while (emptyProbeCountNs < MAX_EMPTY_PROBE_RETRIES) {
+        if (!hasTools || hasToolCalls(fullText)) break;
+        const trimmedNs = fullText.trim();
+        const ultraShortNs = trimmedNs.length < 3 && !trimmedNs.match(/\d/);
+        const suspiciousShortNs =
+            trimmedNs.length >= 3
+            && trimmedNs.length < SUSPICIOUSLY_SHORT_LEN
+            && !trimmedNs.match(/\d/)
+            && upstreamFinishReasonNs === 'end_turn';
+        if (!ultraShortNs && !suspiciousShortNs) break;
+
+        emptyProbeCountNs++;
+        log.warn(
+            'Handler',
+            'retry',
+            ultraShortNs
+                ? `非流式响应过短 (${fullText.length} chars: "${trimmedNs}")，probe 第${emptyProbeCountNs}次`
+                : `非流式提前结束短响应 (${trimmedNs.length} chars)，probe 第${emptyProbeCountNs}次`,
+        );
+        activeCursorReq = await convertToCursorRequest(buildShortResponseRetryRequest(body, fullText));
+        const probeFull = await sendCursorRequestFull(activeCursorReq);
+        fullText = probeFull.text;
+        cursorUsage = probeFull.usage;
+        if (probeFull.finishReason) upstreamFinishReasonNs = probeFull.finishReason;
+        if (hasLeadingThinking(fullText)) {
+            const { thinkingContent: probeT, strippedText: probeS } = extractThinking(fullText);
+            if (probeT && !thinkingContent) thinkingContent = probeT;
+            fullText = probeS;
+        }
+        log.info('Handler', 'retry', `非流式 probe 后: ${fullText.length} chars`, { preview: fullText.substring(0, 200) });
+    }
+    fullText = applyEmptyUpstreamSyntheticFallback(body, fullText, log);
+
+    {
+        const tcNs = body.tool_choice;
+        let keepRoundNs = 0;
+        while (
+            keepRoundNs < MAX_UPSTREAM_SESSION_KEEPALIVE_ROUNDS
+            && hasTools
+            && !hasToolCalls(fullText)
+            && upstreamFinishReasonNs === 'end_turn'
+            && tcNs?.type !== 'any'
+        ) {
+            const tSoftNs = fullText.trim();
+            if (
+                tSoftNs.length === 0
+                || tSoftNs.length > NO_JSON_ACTION_SOFT_PLAIN_MAX_CHARS
+                || isRefusal(fullText)
+                || fullText.includes('```json action')
+            ) {
+                break;
+            }
+            keepRoundNs++;
+            if (keepRoundNs === 1) {
+                log.warn('Handler', 'retry', `非流式会话保持：上游软提醒 ${keepRoundNs}/${MAX_UPSTREAM_SESSION_KEEPALIVE_ROUNDS}（${tSoftNs.length} chars）`);
+                activeCursorReq = appendCursorToolReminderRound(activeCursorReq, fullText, body);
+            } else {
+                const probeIdx = Math.min(keepRoundNs - 2, SESSION_KEEPALIVE_USER_PROBES.length - 1);
+                log.warn('Handler', 'retry', `非流式会话保持：上游续通信 ${keepRoundNs}/${MAX_UPSTREAM_SESSION_KEEPALIVE_ROUNDS}`);
+                activeCursorReq = appendCursorAssistantUserRound(activeCursorReq, fullText, SESSION_KEEPALIVE_USER_PROBES[probeIdx]);
+            }
+            const softFull = await sendCursorRequestFull(activeCursorReq);
+            fullText = softFull.text;
+            cursorUsage = softFull.usage;
+            if (softFull.finishReason) upstreamFinishReasonNs = softFull.finishReason;
+            if (hasLeadingThinking(fullText)) {
+                const { thinkingContent: st, strippedText: ss } = extractThinking(fullText);
+                if (st && !thinkingContent) thinkingContent = st;
+                fullText = ss;
+            }
+            log.info('Handler', 'retry', `非流式会话保持回合 ${keepRoundNs} 后: ${fullText.length} chars`, { preview: fullText.substring(0, 200) });
+        }
     }
 
     // ★ 内部截断续写（与流式路径对齐）
@@ -1987,6 +2286,16 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
         }
     }
 
+    let splitRecoveryMaxTokensFull = false;
+    {
+        const sufFull = getSplitTaskRecoverySuffix(fullText);
+        if (sufFull) {
+            log.warn('Handler', 'retry', `非流式拆分任务容错: ${sufFull.kind}`);
+            fullText += sufFull.suffix;
+            if (sufFull.forceMaxTokensStop) splitRecoveryMaxTokensFull = true;
+        }
+    }
+
     const contentBlocks: AnthropicContentBlock[] = [];
 
     // ★ Thinking 内容作为第一个 content block（仅客户端原生请求时）
@@ -1996,7 +2305,11 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
 
     // ★ 截断检测：代码块/XML 未闭合时，返回 max_tokens 让 Claude Code 自动继续
     let stopReason = shouldAutoContinueTruncatedToolResponse(fullText, hasTools) ? 'max_tokens' : 'end_turn';
-    if (stopReason === 'max_tokens') {
+    if (splitRecoveryMaxTokensFull) {
+        stopReason = 'max_tokens';
+        log.info('Handler', 'truncation', '非流式拆分任务容错(输出上限类) → stop_reason=max_tokens');
+    }
+    if (stopReason === 'max_tokens' && !splitRecoveryMaxTokensFull) {
         log.warn('Handler', 'truncation', `非流式检测到截断响应 (${fullText.length} chars) → stop_reason=max_tokens`);
     }
 

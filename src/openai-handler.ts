@@ -37,12 +37,15 @@ import {
     isIdentityProbe,
     isToolCapabilityQuestion,
     buildRetryRequest,
+    buildShortResponseRetryRequest,
+    buildThinkingFragmentRetryRequest,
     extractThinking,
     CLAUDE_IDENTITY_RESPONSE,
     CLAUDE_TOOLS_RESPONSE,
     MAX_REFUSAL_RETRIES,
     estimateInputTokens,
 } from './handler.js';
+import { looksLikeThinkingFragment, isTruncated } from './truncation-detector.js';
 
 function chatId(): string {
     return 'chatcmpl-' + uuidv4().replace(/-/g, '').substring(0, 24);
@@ -776,6 +779,13 @@ async function handleOpenAIStream(
     const model = body.model;
     const hasTools = (body.tools?.length ?? 0) > 0;
 
+    // ★ 监控：下游主动断开时记录时机
+    res.on('close', () => {
+        if (!res.writableEnded) {
+            console.warn(`[SSE] ⚠ [${id}] 下游在流结束前主动断开连接 (${new Date().toISOString()})`);
+        }
+    });
+
     // 发送 role delta
     writeOpenAISSE(res, {
         id, object: 'chat.completion.chunk', created, model,
@@ -792,9 +802,15 @@ async function handleOpenAIStream(
     let retryCount = 0;
 
     // 统一缓冲模式：先缓冲全部响应，再检测拒绝和处理
+    let upstreamFinishReason = 'end_turn';
     const executeStream = async (onTextDelta?: (delta: string) => void) => {
         fullResponse = '';
+        upstreamFinishReason = 'end_turn';
         await sendCursorRequest(activeCursorReq, (event: CursorSSEEvent) => {
+            if (event.type === 'finish') {
+                if (event.finishReason) upstreamFinishReason = event.finishReason;
+                return;
+            }
             if (event.type !== 'text-delta' || !event.delta) return;
             fullResponse += event.delta;
             onTextDelta?.(event.delta);
@@ -961,11 +977,73 @@ async function handleOpenAIStream(
             }
         }
 
-        // 极短响应重试
+        // 极短响应重试：追加 check 探针用户消息再请求上游
         if (hasTools && fullResponse.trim().length < 10 && retryCount < MAX_REFUSAL_RETRIES) {
             retryCount++;
-            activeCursorReq = await convertToCursorRequest(anthropicReq);
+            activeCursorReq = await convertToCursorRequest(buildShortResponseRetryRequest(anthropicReq, fullResponse));
             await executeStream();
+            if (hasLeadingThinking(fullResponse)) {
+                const { thinkingContent: extracted, strippedText } = extractThinking(fullResponse);
+                if (extracted && thinkingEnabled && !reasoningContent) {
+                    reasoningContent = extracted;
+                }
+                fullResponse = strippedText;
+            }
+        }
+
+        {
+            const t = fullResponse.trim();
+            const thinkingFrag = looksLikeThinkingFragment(fullResponse, upstreamFinishReason, hasTools);
+            if (hasTools && (t.length < 3 && !t.match(/\d/) || thinkingFrag) && !hasToolCalls(fullResponse)) {
+                // ★ P1: 思考片段带上下文重试，比空 fallback 更有效
+                if (thinkingFrag && t.length >= 10 && retryCount < MAX_REFUSAL_RETRIES) {
+                    retryCount++;
+                    log.warn('OpenAI', 'retry', `思考片段重试 (${t.length} chars, finishReason=${upstreamFinishReason})，注入上下文第${retryCount}次`);
+                    activeCursorReq = await convertToCursorRequest(buildThinkingFragmentRetryRequest(anthropicReq, t));
+                    await executeStream(processHybridDelta);
+                    hybridTextSent = hybridTextSent || false; // executeStream resets fullResponse
+                    // 重新计算 t 以决定是否仍需 fallback
+                    const t2 = fullResponse.trim();
+                    if (hasToolCalls(fullResponse) || t2.length >= 10) {
+                        // 重试成功，跳过 fallback
+                    } else {
+                        fullResponse = 'Let me proceed with the task.';
+                        hybridTextSent = false;
+                    }
+                } else {
+                    // 生成 fallback 工具调用，让下游继续工具循环（纯文本 end_turn 会卡住）
+                    const fallbackTool = body.tools?.[0];
+                    if (fallbackTool) {
+                        const fallbackParams = fallbackTool.function?.parameters?.properties
+                            ? Object.fromEntries(Object.entries(fallbackTool.function.parameters.properties as Record<string, { type?: string }>).slice(0, 1).map(([k, v]) => [k, v.type === 'boolean' ? true : v.type === 'number' ? 0 : '']))
+                            : {};
+                        fullResponse = `\`\`\`json action\n${JSON.stringify({ tool: fallbackTool.function?.name ?? fallbackTool.type, parameters: fallbackParams }, null, 2)}\n\`\`\``;
+                    } else {
+                        fullResponse = 'Let me proceed with the task.';
+                    }
+                    // 重置混合流式标记：降级内容必须发给下游，不能被 hybridTextSent 跳过
+                    hybridTextSent = false;
+                    // Proposal 1: 发送 SSE 流状态事件告知下游已降级
+                    emitOpenAIStreamStatus(res, id, created, model, 'degrade', 'UPSTREAM_EMPTY', '上游未返回有效内容，已切换降级响应', {
+                        retryCount,
+                        bytesSoFar: t.length,
+                    });
+                }
+            }
+        }
+
+        // ★ P3: 提前结束检测 — stop_reason=end_turn 但内容异常短，发起 probe 重试
+        const earlyTrimmed = fullResponse.trim();
+        if (hasTools && !hasToolCalls(fullResponse)
+            && earlyTrimmed.length >= 3 && earlyTrimmed.length < 30
+            && !earlyTrimmed.match(/\d/)
+            && upstreamFinishReason === 'end_turn'
+            && retryCount < MAX_REFUSAL_RETRIES) {
+            retryCount++;
+            log.warn('OpenAI', 'retry', `提前结束检测到短响应 (${earlyTrimmed.length} chars)，probe 重试第${retryCount}次`);
+            activeCursorReq = await convertToCursorRequest(buildShortResponseRetryRequest(anthropicReq, fullResponse));
+            await executeStream(processHybridDelta);
+            hybridTextSent = hybridTextSent || false;
         }
 
         if (hasTools) {
@@ -1110,6 +1188,14 @@ async function handleOpenAIStream(
         log.recordFinalResponse(fullResponse);
         log.complete(fullResponse.length, finishReason);
 
+        // Proposal 1: 发送 receipt 事件记录流完整性元数据
+        emitOpenAIStreamStatus(res, id, created, model, 'receipt', 'STREAM_COMPLETE', '流式响应正常结束', {
+            totalBytes: fullResponse.length,
+            stopReason: finishReason,
+            hasToolCalls: hasToolCalls(fullResponse),
+            isDegraded: false,
+        });
+
         res.write('data: [DONE]\n\n');
 
     } catch (err: unknown) {
@@ -1122,6 +1208,13 @@ async function handleOpenAIStream(
                 delta: { content: `\n\n[Error: ${message}]` },
                 finish_reason: 'stop',
             }],
+        });
+        // Proposal 1: 发送 receipt 事件记录错误导致的异常结束
+        emitOpenAIStreamStatus(res, id, created, model, 'receipt', 'STREAM_ERROR', message, {
+            totalBytes: 0,
+            stopReason: 'error',
+            hasToolCalls: false,
+            isDegraded: true,
         });
         res.write('data: [DONE]\n\n');
     }
@@ -1161,8 +1254,10 @@ async function handleOpenAINonStream(
     // 拒绝检测 + 自动重试（在 thinking 提取之后，只检测实际输出内容）
     const shouldRetry = () => isRefusal(fullText) && !(hasTools && hasToolCalls(fullText));
 
+    let refusalRetryCount = 0;
     if (shouldRetry()) {
         for (let attempt = 0; attempt < MAX_REFUSAL_RETRIES; attempt++) {
+            refusalRetryCount++;
             // 重试记录
             const retryBody = buildRetryRequest(anthropicReq, attempt);
             const retryCursorReq = await convertToCursorRequest(retryBody);
@@ -1185,6 +1280,25 @@ async function handleOpenAINonStream(
                 // 记录在详细日志
                 fullText = CLAUDE_IDENTITY_RESPONSE;
             }
+        }
+    }
+
+    if (hasTools && fullText.trim().length < 10 && refusalRetryCount < MAX_REFUSAL_RETRIES) {
+        activeCursorReq = await convertToCursorRequest(buildShortResponseRetryRequest(anthropicReq, fullText));
+        fullText = (await sendCursorRequestFull(activeCursorReq)).text;
+        if (hasLeadingThinking(fullText)) {
+            const { thinkingContent: extracted, strippedText } = extractThinking(fullText);
+            if (extracted && thinkingEnabled && !reasoningContent) {
+                reasoningContent = extracted;
+            }
+            fullText = strippedText;
+        }
+    }
+
+    {
+        const t = fullText.trim();
+        if (hasTools && t.length < 3 && !t.match(/\d/) && !hasToolCalls(fullText)) {
+            fullText = 'Let me proceed with the task.';
         }
     }
 
@@ -1281,10 +1395,49 @@ function stripMarkdownJsonWrapper(text: string): string {
 }
 
 function writeOpenAISSE(res: Response, data: OpenAIChatCompletionChunk): void {
-    res.write(`data: ${JSON.stringify(data)}\n\n`);
+    if (res.writableEnded || res.destroyed) {
+        console.warn(`[SSE] ⚠ 连接已关闭，跳过 OpenAI SSE chunk（writableEnded=${res.writableEnded} destroyed=${res.destroyed}）`);
+        return;
+    }
+    const ok = res.write(`data: ${JSON.stringify(data)}\n\n`);
+    if (!ok) {
+        console.warn(`[SSE] ⚠ res.write 返回 false（背压/连接断开），chunk id=${data.id}`);
+    }
     if (typeof (res as unknown as { flush: () => void }).flush === 'function') {
         (res as unknown as { flush: () => void }).flush();
     }
+}
+
+// ==================== SSE 流元数据事件 ====================
+
+/**
+ * 发送 cursor-stream-status SSE 事件（OpenAI 格式）
+ * 嵌入 status 信息到 chunk 的 stream_status 字段
+ * 向后兼容：OpenAI 客户端会忽略未知字段
+ */
+function emitOpenAIStreamStatus(
+    res: Response,
+    id: string,
+    created: number,
+    model: string,
+    status: 'degrade' | 'receipt' | 'status',
+    code: string,
+    message: string,
+    metadata: Record<string, unknown> = {},
+): void {
+    writeOpenAISSE(res, {
+        id,
+        object: 'chat.completion.chunk',
+        created,
+        model,
+        choices: [{
+            index: 0,
+            delta: {},
+            finish_reason: 'stop',
+        }],
+        // 自定义字段，下游可解析；标准 OpenAI 客户端忽略
+        stream_status: { type: 'cursor-stream-status', status, code, message, ...metadata },
+    } as unknown as OpenAIChatCompletionChunk);
 }
 
 // ==================== /v1/responses 支持 ====================

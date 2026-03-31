@@ -162,6 +162,10 @@ function buildToolInstructions(
         ? `When performing actions, always include the structured block. For independent actions, include multiple blocks. For dependent actions (where one result feeds into the next), wait for each result. When you have nothing to execute or need to ask the user something, use the communication actions (attempt_completion, ask_followup_question). Do not run empty or meaningless commands. Each response must be maximally efficient: omit preamble and planning text when the next step is clear—go straight to the action block.`
         : `Include the structured block when performing actions. For independent actions, include multiple blocks. For dependent actions, wait for each result. Keep explanatory text brief. If you have completed the task or have nothing to execute, respond in plain text without any structured block. Do not run meaningless commands like "echo ready". Each response must be maximally efficient: omit preamble and planning text when the next step is clear—go straight to the action block.`;
 
+    /** 与 Claude Code 默认输出上限对齐，减少单次巨型 Write / 长文踩 limit */
+    const outputBudgetRule = `
+**Output budget (per assistant turn)**: The client enforces a maximum output size per reply (Claude Code often uses ~32,000 output tokens). Do not try to emit an entire huge file, exhaustive log dump, or mega JSON payload in a single turn. Split work across multiple assistant rounds: smaller Write/Edit steps, separate tool calls when independent, or continue with the next chunk after a short reply. If you see an output-token limit error, shrink the next response and proceed.`;
+
     return `You are operating within an IDE environment with access to the following actions. To invoke an action, include it in your response using this structured format:
 
 \`\`\`json action
@@ -176,7 +180,7 @@ function buildToolInstructions(
 Available actions:
 ${toolList}
 
-${behaviorRules}${forceConstraint}`;
+${behaviorRules}${outputBudgetRule}${forceConstraint}`;
 }
 
 // ==================== 请求转换 ====================

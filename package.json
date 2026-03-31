@@ -4,7 +4,8 @@
   "description": "Proxy Cursor docs AI to Anthropic Messages API for Claude Code",
   "type": "module",
   "scripts": {
-    "dev": "tsx watch src/index.ts",
+    "dev": "tsx watch --clear-screen=false src/index.ts",
+    "dev:once": "tsx src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
     "test:handler-truncation": "node test/unit-handler-truncation.mjs",

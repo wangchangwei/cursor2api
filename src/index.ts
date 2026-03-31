@@ -162,7 +162,16 @@ if (config.logging?.db_enabled) {
 // ★ 从日志文件加载历史（必须在 listen 之前）
 loadLogsFromFiles();
 
-app.listen(config.port, () => {
+// 未捕获异常时打印原因（避免 dev 下“无声退出”）
+process.on('uncaughtException', (err) => {
+    console.error('[Fatal] uncaughtException:', err);
+    process.exit(1);
+});
+process.on('unhandledRejection', (reason) => {
+    console.error('[Fatal] unhandledRejection:', reason);
+});
+
+const server = app.listen(config.port, () => {
     const auth = config.authTokens?.length ? `${config.authTokens.length} token(s)` : 'open';
     const logParts: string[] = [];
     if (config.logging?.file_enabled) logParts.push(`file(${config.logging.persist_mode || 'summary'}) → ${config.logging.dir}`);
@@ -202,12 +211,28 @@ app.listen(config.port, () => {
     initConfigWatcher();
 });
 
-// ★ 优雅关闭：停止文件监听
-process.on('SIGTERM', () => {
-    stopConfigWatcher();
-    process.exit(0);
+server.on('error', (err: NodeJS.ErrnoException) => {
+    if (err.code === 'EADDRINUSE') {
+        console.error(`[Server] 端口 ${config.port} 已被占用（是否仍有旧的 npm run dev / node 进程？）`);
+    } else {
+        console.error('[Server] listen 错误:', err);
+    }
+    process.exit(1);
 });
-process.on('SIGINT', () => {
+
+/** 先关 HTTP、再关 config 监听，便于 tsx watch 重启时释放端口（避免 “Previous process hasn't exited yet”） */
+function gracefulShutdown(signal: string): void {
+    console.log(`\n[Server] 收到 ${signal}，正在关闭连接...`);
     stopConfigWatcher();
-    process.exit(0);
-});
+    server.close((closeErr) => {
+        if (closeErr) console.error('[Server] close:', closeErr);
+        process.exit(closeErr ? 1 : 0);
+    });
+    setTimeout(() => {
+        console.error('[Server] close 超时，强制退出');
+        process.exit(1);
+    }, 10_000).unref();
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));

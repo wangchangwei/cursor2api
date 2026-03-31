@@ -4,14 +4,17 @@ FROM node:22-alpine AS builder
 # 设置工作目录
 WORKDIR /app
 
+# better-sqlite3 等在 prebuild 失败时需本地编译（node-gyp）
+RUN apk add --no-cache python3 make g++
+
 # 仅拷贝包配置并安装所有依赖项（利用 Docker 缓存层）
 COPY package.json package-lock.json ./
 RUN npm ci
 
-# 拷贝项目源代码并执行 TypeScript 编译
+# 拷贝项目源代码并执行 TypeScript 编译；去掉 devDependencies 以减小复制到运行阶段的体积
 COPY tsconfig.json ./
 COPY src ./src
-RUN npm run build
+RUN npm run build && npm prune --omit=dev
 
 # ==== Stage 2: 生产运行阶段 (Runner) ====
 FROM node:22-alpine AS runner
@@ -28,10 +31,11 @@ ENV NODE_OPTIONS="--max-old-space-size=4096"
 RUN addgroup --system --gid 1001 nodejs && \
     adduser --system --uid 1001 cursor
 
-# 拷贝包配置并仅安装生产环境依赖（极大减小镜像体积）
+# 包清单（运行时需要，例如入口读取版本号）
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev \
-    && npm cache clean --force
+
+# 从 builder 拷贝已编译的原生模块与生产依赖（避免运行阶段再 npm ci 触发 node-gyp）
+COPY --from=builder --chown=cursor:nodejs /app/node_modules ./node_modules
 
 # 从 builder 阶段拷贝编译后的产物
 COPY --from=builder --chown=cursor:nodejs /app/dist ./dist

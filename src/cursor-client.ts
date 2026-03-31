@@ -61,7 +61,11 @@ export async function sendCursorRequest(
             // ★ 退化循环中止不重试 — 已有的内容是有效的，重试也会重蹈覆辙
             if (err instanceof Error && err.message === 'DEGENERATE_LOOP_ABORTED') return;
             const msg = err instanceof Error ? err.message : String(err);
-            console.error(`[Cursor] 请求失败 (${attempt}/${maxRetries}): ${msg.substring(0, 100)}`);
+            const cause = err instanceof Error && err.cause != null
+                ? (err.cause instanceof Error ? err.cause.message : String(err.cause))
+                : '';
+            const detail = cause ? `${msg} | cause: ${cause}` : msg;
+            console.error(`[Cursor] 请求失败 (${attempt}/${maxRetries}): ${detail.substring(0, 200)}`);
             if (attempt < maxRetries) {
                 await new Promise(r => setTimeout(r, 2000));
             } else {
@@ -249,10 +253,18 @@ async function sendCursorRequestInner(
 /**
  * 发送非流式请求，收集完整响应及 usage 信息
  */
-export async function sendCursorRequestFull(req: CursorChatRequest): Promise<{ text: string; usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number } }> {
+export async function sendCursorRequestFull(req: CursorChatRequest): Promise<{
+    text: string;
+    usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
+    finishReason?: string;
+}> {
     let fullText = '';
     let usage: { inputTokens?: number; outputTokens?: number; totalTokens?: number } | undefined;
+    let finishReason: string | undefined;
     await sendCursorRequest(req, (event) => {
+        if (event.type === 'finish' && event.finishReason) {
+            finishReason = event.finishReason;
+        }
         if (event.type === 'text-delta' && event.delta) {
             fullText += event.delta;
         }
@@ -260,5 +272,5 @@ export async function sendCursorRequestFull(req: CursorChatRequest): Promise<{ t
             usage = event.messageMetadata.usage;
         }
     });
-    return { text: fullText, usage };
+    return { text: fullText, usage, finishReason };
 }

@@ -1,0 +1,11 @@
+{
+  "session_id": "BRS-downstream-keepalive-20260331",
+  "pipeline": "deep",
+  "angles": ["下游连接保活"],
+  "topic": "修复下游断开问题（响应过短/空内容导致下游断流）",
+  "gc_round": 0,
+  "max_gc_rounds": 2,
+  "completion_action": "auto_keep",
+  "task_count": 3,
+  "created_at": "2026-03-31T00:00:00+08:00"
+}

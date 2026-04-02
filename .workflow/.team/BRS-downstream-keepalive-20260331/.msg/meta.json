@@ -1,0 +1,254 @@
+{
+  "session_id": "BRS-downstream-keepalive-20260331",
+  "pipeline": "deep",
+  "angles": [
+    "下游连接保活"
+  ],
+  "topic": "修复下游断开问题（响应过短/空内容导致下游断流）",
+  "gc_round": 1,
+  "max_gc_rounds": 2,
+  "completion_action": "auto_keep",
+  "task_count": 3,
+  "created_at": "2026-03-31T00:00:00+08:00",
+  "generated_ideas": [
+    {
+      "id": "IDEA-1",
+      "title": "请求前上游健康探测（Pre-stream Probe）",
+      "round": 0,
+      "revised": false,
+      "file": "ideas/idea-1.md"
+    },
+    {
+      "id": "IDEA-2",
+      "title": "字节速度窗口监控（Byte Velocity Monitor）",
+      "round": 0,
+      "revised": false,
+      "file": "ideas/idea-1.md"
+    },
+    {
+      "id": "IDEA-3",
+      "title": "SSE多路复用结构化消息帧（SSE Structured Frame）",
+      "round": 0,
+      "revised": false,
+      "file": "ideas/idea-1.md"
+    },
+    {
+      "id": "IDEA-4",
+      "title": "短路熔断器模式（Circuit Breaker for Cursor API）",
+      "round": 0,
+      "revised": false,
+      "file": "ideas/idea-1.md"
+    },
+    {
+      "id": "IDEA-5",
+      "title": "连接上下文保持重试（Connection Context Preservation）",
+      "round": 0,
+      "revised": false,
+      "file": "ideas/idea-1.md"
+    },
+    {
+      "id": "IDEA-6",
+      "title": "最小有效负载保证（Minimum Viable Payload）",
+      "round": 0,
+      "revised": false,
+      "file": "ideas/idea-1.md"
+    },
+    {
+      "id": "IDEA-7",
+      "title": "语义化降级响应（Semantic Degraded Response）",
+      "round": 0,
+      "revised": false,
+      "file": "ideas/idea-1.md"
+    },
+    {
+      "id": "IDEA-8",
+      "title": "响应完整性契约（Completeness Receipt）",
+      "round": 0,
+      "revised": false,
+      "file": "ideas/idea-1.md"
+    }
+  ],
+  "critique_insights": [
+    {
+      "idea": "IDEA-1",
+      "severity": "CRITICAL",
+      "key_challenge": "循环依赖假设：probe 假设 upstream 有内容，但这就是要解决的问题；额外 2-3s 延迟惩罚所有请求；probe 本身可能消耗配额加剧限流",
+      "round": 0
+    },
+    {
+      "idea": "IDEA-2",
+      "severity": "HIGH",
+      "key_challenge": "阈值（50bytes/5s）无数据支撑；中途重试可能导致下游收到重复/乱序内容；与现有退化检测/空闲超时机制边界不清晰",
+      "round": 0
+    },
+    {
+      "idea": "IDEA-3",
+      "severity": "MEDIUM",
+      "key_challenge": "下游兼容性未验证；协议设计不完整（字段语义、时序无定义）；本质是通知机制不解决断流本身",
+      "round": 0
+    },
+    {
+      "idea": "IDEA-4",
+      "severity": "MEDIUM",
+      "key_challenge": "假设断流是持续性问题，但实际高度偶发；熔断后所有请求集体降级 60s，把偶发问题放大为集体惩罚",
+      "round": 0
+    },
+    {
+      "idea": "IDEA-5",
+      "severity": "HIGH",
+      "key_challenge": "截断内容（半句/无效语法）作为上下文可能引入噪声；实现复杂度被低估；下游仍看到不完整响应只是事后补救",
+      "round": 0
+    },
+    {
+      "idea": "IDEA-6",
+      "severity": "HIGH",
+      "key_challenge": "人工内容 'Processing your request...' 欺骗下游；可能覆盖真实 thinking 或污染 Claude Code 解析；与 keepalive 已有效果重叠",
+      "round": 0
+    },
+    {
+      "idea": "IDEA-7",
+      "severity": "LOW",
+      "key_challenge": "SSE event:error 非标准语义，浏览器 SSE 解析器行为未验证；建议改用 event:degrade 或 event:status",
+      "round": 0
+    },
+    {
+      "idea": "IDEA-8",
+      "severity": "MEDIUM",
+      "key_challenge": "res.end() 前发送 receipt，此时流已结束，是事后可观测性工具非实时修复；与 IDEA-3 功能高度重叠",
+      "round": 0
+    }
+  ],
+  "gc_signal": "REVISION_NEEDED",
+  "critique_file": "critiques/critique-1.md",
+  "critique_round": 0,
+  "synthesis_file": "synthesis/synthesis-1.md",
+  "synthesis_themes": [
+    {
+      "name": "Upstream State Awareness",
+      "strength": 9,
+      "supporting_ideas": [
+        "IDEA-1",
+        "IDEA-2",
+        "IDEA-4",
+        "IDEA-8"
+      ]
+    },
+    {
+      "name": "Structured Stream Communication",
+      "strength": 8,
+      "supporting_ideas": [
+        "IDEA-3",
+        "IDEA-7",
+        "IDEA-8"
+      ]
+    },
+    {
+      "name": "Cascading Failure Prevention",
+      "strength": 6,
+      "supporting_ideas": [
+        "IDEA-4",
+        "IDEA-5"
+      ]
+    },
+    {
+      "name": "Response Guarantee Signals",
+      "strength": 5,
+      "supporting_ideas": [
+        "IDEA-6",
+        "IDEA-7"
+      ]
+    }
+  ],
+  "synthesis_proposals": [
+    {
+      "id": "PROPOSAL-1",
+      "title": "Unified SSE Stream Metadata Protocol",
+      "feasibility": 8,
+      "innovation": 5,
+      "combines": [
+        "IDEA-3",
+        "IDEA-7",
+        "IDEA-8"
+      ],
+      "status": "recommended"
+    },
+    {
+      "id": "PROPOSAL-2",
+      "title": "Adaptive Per-Request Degradation Hints",
+      "feasibility": 6,
+      "innovation": 7,
+      "combines": [
+        "IDEA-4",
+        "IDEA-2",
+        "IDEA-5"
+      ],
+      "status": "recommended"
+    }
+  ],
+  "evaluation_scores": [
+    {
+      "id": "PROPOSAL-1",
+      "title": "Unified SSE Stream Metadata Protocol",
+      "rank": 1,
+      "feasibility": 8,
+      "innovation": 5,
+      "impact": 7,
+      "cost_efficiency": 8,
+      "weighted_score": 7.00,
+      "recommendation": "Strong Recommend",
+      "evaluation_file": "evaluation/evaluation-1.md"
+    },
+    {
+      "id": "PROPOSAL-2",
+      "title": "Adaptive Per-Request Degradation Hints",
+      "rank": 2,
+      "feasibility": 6,
+      "innovation": 7,
+      "impact": 8,
+      "cost_efficiency": 5,
+      "weighted_score": 6.55,
+      "recommendation": "Recommend"
+    }
+  ],
+  "role_state": {
+    "synthesizer": {
+      "status": "synthesis_complete",
+      "synthesis_file": "synthesis/synthesis-1.md",
+      "proposals_generated": 2,
+      "themes_extracted": 4,
+      "conflicts_resolved": 7,
+      "ideas_addressed": {
+        "abandoned": [
+          "IDEA-1"
+        ],
+        "merged": [
+          "IDEA-3",
+          "IDEA-7",
+          "IDEA-8"
+        ],
+        "refined": [
+          "IDEA-2",
+          "IDEA-4",
+          "IDEA-5",
+          "IDEA-6"
+        ]
+      },
+      "proposal_1": "Unified SSE Stream Metadata Protocol (feasibility=8, innovation=5)",
+      "proposal_2": "Adaptive Per-Request Degradation Hints (feasibility=6, innovation=7)",
+      "quality_checks": "all_passed",
+      "recommendation": "Implement Proposal 1 first (low risk, immediate value), then Proposal 2 (requires empirical threshold tuning)",
+      "_updated_at": "2026-03-31T03:44:33.551+00:00"
+    },
+    "evaluator": {
+      "status": "evaluation_complete",
+      "evaluation_file": "evaluation/evaluation-1.md",
+      "proposals_scored": 2,
+      "rank_1": "PROPOSAL-1 (Unified SSE Stream Metadata Protocol, score=7.00)",
+      "rank_2": "PROPOSAL-2 (Adaptive Per-Request Degradation Hints, score=6.55)",
+      "recommendation": "Implement PROPOSAL-1 first (Strong Recommend, low risk, immediate value); revisit PROPOSAL-2 after SSE telemetry layer deployed",
+      "consistency_checks": "all_passed",
+      "_updated_at": "2026-03-31T04:00:00.000+00:00"
+    }
+  },
+  "updated_at": "2026-03-31T03:44:33.551+00:00"
+}

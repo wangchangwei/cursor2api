@@ -4,11 +4,19 @@ FROM node:22-alpine AS builder
 # 设置工作目录
 WORKDIR /app
 
+# 国内或 dl-cdn 极慢时: docker compose build --build-arg USE_CN_APK_MIRROR=1
+ARG USE_CN_APK_MIRROR=0
+RUN if [ "$USE_CN_APK_MIRROR" = "1" ]; then \
+      sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories; \
+    fi
+
 # better-sqlite3 等在 prebuild 失败时需本地编译（node-gyp）
 RUN apk add --no-cache python3 make g++
 
 # 仅拷贝包配置并安装所有依赖项（利用 Docker 缓存层）
 COPY package.json package-lock.json ./
+# 使用官方镜像内已带的头文件，避免 node-gyp 访问 unofficial-builds.nodejs.org（部分网络下会 DNS 失败）
+ENV npm_config_nodedir=/usr/local
 RUN npm ci
 
 # 拷贝项目源代码并执行 TypeScript 编译；去掉 devDependencies 以减小复制到运行阶段的体积
@@ -20,6 +28,24 @@ RUN npm run build && npm prune --omit=dev
 FROM node:22-alpine AS runner
 
 WORKDIR /app
+
+# ── Puppeteer Chrome 依赖 ──────────────────────────────────────────────────────
+# Alpine 默认源 chromium 版本较旧，建议用腾讯云镜像或官方源
+RUN apk add --no-cache \
+        chromium \
+        chromium-chromedriver \
+        nss \
+        freetype \
+        harfbuzz \
+        fontconfig \
+        ttf-freefont \
+        udev \
+    && rm -rf /var/cache/apk/* /tmp/*
+
+# 让 Puppeteer 找到系统 Chrome（Alpine 官方 chromium 包路径）
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=1
+# ─────────────────────────────────────────────────────────────────────────────
 
 # 设置为生产环境
 ENV NODE_ENV=production

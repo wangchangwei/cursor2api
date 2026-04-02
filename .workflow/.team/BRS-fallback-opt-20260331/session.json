@@ -1,0 +1,17 @@
+{
+  "session_id": "BRS-fallback-opt-20260331",
+  "topic": "cursor2api 防截断与 fallback 工具调用机制 — 最优设计方案",
+  "pipeline": "full",
+  "status": "active",
+  "created_at": "2026-03-31",
+  "completion_action": "auto_keep",
+  "gc_round": 0,
+  "tasks": {
+    "IDEA-001": { "role": "ideator", "status": "pending", "blockedBy": [] },
+    "IDEA-002": { "role": "ideator", "status": "pending", "blockedBy": [] },
+    "IDEA-003": { "role": "ideator", "status": "pending", "blockedBy": [] },
+    "CHALLENGE-001": { "role": "challenger", "status": "pending", "blockedBy": ["IDEA-001","IDEA-002","IDEA-003"] },
+    "SYNTH-001": { "role": "synthesizer", "status": "pending", "blockedBy": ["CHALLENGE-001"] },
+    "EVAL-001": { "role": "evaluator", "status": "pending", "blockedBy": ["SYNTH-001"] }
+  }
+}

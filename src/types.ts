@@ -113,6 +113,7 @@ export interface AppConfig {
     timeout: number;
     proxy?: string;
     cursorModel: string;
+    flareSolverrUrl?: string;  // FlareSolverr URL（检测到 CF 挑战时自动使用）
     authTokens?: string[];  // API 鉴权 token 列表，为空则不鉴权
     maxAutoContinue: number;        // 自动续写最大次数，默认 3，设 0 禁用
     maxHistoryMessages: number;     // 历史消息条数硬限制，默认 -1（不限制）
@@ -157,5 +158,6 @@ export interface AppConfig {
     refusalPatterns?: string[];  // 自定义拒绝检测规则（追加到内置列表之后）
     fingerprint: {
         userAgent: string;
+        chromePath?: string;  // Puppeteer 使用的 Chrome 路径（可选，默认用 Puppeteer 自带的 Chromium）
     };
 }

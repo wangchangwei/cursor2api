@@ -34,12 +34,14 @@ function parseYamlConfig(defaults: AppConfig): { config: AppConfig; raw: Record<
         if (yaml.port) result.port = yaml.port;
         if (yaml.timeout) result.timeout = yaml.timeout;
         if (yaml.proxy) result.proxy = yaml.proxy;
+        if (yaml.flare_solverr_url) result.flareSolverrUrl = yaml.flare_solverr_url;
         if (yaml.cursor_model) result.cursorModel = yaml.cursor_model;
         if (typeof yaml.max_auto_continue === 'number') result.maxAutoContinue = yaml.max_auto_continue;
         if (typeof yaml.max_history_messages === 'number') result.maxHistoryMessages = yaml.max_history_messages;
         if (typeof yaml.max_history_tokens === 'number') result.maxHistoryTokens = yaml.max_history_tokens;
         if (yaml.fingerprint) {
             if (yaml.fingerprint.user_agent) result.fingerprint.userAgent = yaml.fingerprint.user_agent;
+            if (yaml.fingerprint.chrome_path) result.fingerprint.chromePath = yaml.fingerprint.chrome_path;
         }
         if (yaml.vision) {
             result.vision = {
@@ -126,6 +128,11 @@ function applyEnvOverrides(cfg: AppConfig): void {
     if (process.env.PORT) cfg.port = parseInt(process.env.PORT);
     if (process.env.TIMEOUT) cfg.timeout = parseInt(process.env.TIMEOUT);
     if (process.env.PROXY) cfg.proxy = process.env.PROXY;
+    if (process.env.FLARE_SOLVERR_URL) cfg.flareSolverrUrl = process.env.FLARE_SOLVERR_URL;
+    if (process.env.CHROME_PATH) {
+        if (!cfg.fingerprint) cfg.fingerprint = { userAgent: '' };
+        cfg.fingerprint.chromePath = process.env.CHROME_PATH;
+    }
     if (process.env.CURSOR_MODEL) cfg.cursorModel = process.env.CURSOR_MODEL;
     if (process.env.MAX_AUTO_CONTINUE !== undefined) cfg.maxAutoContinue = parseInt(process.env.MAX_AUTO_CONTINUE);
     if (process.env.MAX_HISTORY_MESSAGES !== undefined) cfg.maxHistoryMessages = parseInt(process.env.MAX_HISTORY_MESSAGES);
@@ -242,6 +249,7 @@ function detectChanges(oldCfg: AppConfig, newCfg: AppConfig): string[] {
     if (oldCfg.port !== newCfg.port) changes.push(`port: ${oldCfg.port} → ${newCfg.port}`);
     if (oldCfg.timeout !== newCfg.timeout) changes.push(`timeout: ${oldCfg.timeout} → ${newCfg.timeout}`);
     if (oldCfg.proxy !== newCfg.proxy) changes.push(`proxy: ${oldCfg.proxy || '(none)'} → ${newCfg.proxy || '(none)'}`);
+    if (oldCfg.flareSolverrUrl !== newCfg.flareSolverrUrl) changes.push(`flare_solverr_url: ${oldCfg.flareSolverrUrl || '(none)'} → ${newCfg.flareSolverrUrl || '(none)'}`);
     if (oldCfg.cursorModel !== newCfg.cursorModel) changes.push(`cursor_model: ${oldCfg.cursorModel} → ${newCfg.cursorModel}`);
     if (oldCfg.maxAutoContinue !== newCfg.maxAutoContinue) changes.push(`max_auto_continue: ${oldCfg.maxAutoContinue} → ${newCfg.maxAutoContinue}`);
     if (oldCfg.maxHistoryMessages !== newCfg.maxHistoryMessages) changes.push(`max_history_messages: ${oldCfg.maxHistoryMessages} → ${newCfg.maxHistoryMessages}`);
@@ -275,6 +283,7 @@ function detectChanges(oldCfg: AppConfig, newCfg: AppConfig): string[] {
 
     // fingerprint
     if (oldCfg.fingerprint.userAgent !== newCfg.fingerprint.userAgent) changes.push('fingerprint: (changed)');
+    if (oldCfg.fingerprint.chromePath !== newCfg.fingerprint.chromePath) changes.push('fingerprint.chromePath: (changed)');
 
     return changes;
 }

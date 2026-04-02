@@ -12,6 +12,8 @@
 import type { CursorChatRequest, CursorSSEEvent } from './types.js';
 import { getConfig } from './config.js';
 import { getProxyFetchOptions } from './proxy-agent.js';
+import { puppeteerFetch } from './puppeteer-client.js';
+import { closeBrowser } from './puppeteer-client.js';
 
 const CURSOR_CHAT_API = 'https://cursor.com/api/chat';
 
@@ -120,6 +122,19 @@ async function sendCursorRequestInner(
 
         if (!resp.ok) {
             const body = await resp.text();
+
+            // ★ Cloudflare / Vercel 安全验证检测 → 尝试 Puppeteer 兜底
+            if (resp.status === 403 || resp.status === 429 ||
+                (resp.status === 200 && /cf-|cloudflare|vercel security|astro-cid|security checkpoint/i.test(body))) {
+                console.warn(`[Cursor] 检测到 CF 挑战，尝试 Puppeteer 绕过...`);
+                try {
+                    await puppeteerFetch(req, onChunk, controller.signal);
+                    return;
+                } catch (puErr) {
+                    console.error(`[Cursor] Puppeteer 绕过失败: ${String(puErr)}`);
+                }
+            }
+
             throw new Error(`Cursor API 错误: HTTP ${resp.status} - ${body}`);
         }
 

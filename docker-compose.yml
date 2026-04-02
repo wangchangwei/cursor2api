@@ -3,6 +3,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      # 国内或 Alpine 官方源极慢时取消注释下一行:
+      # args:
+      #   USE_CN_APK_MIRROR: "1"
     image: cursor2api:latest
     container_name: cursor2api
     restart: unless-stopped
@@ -20,6 +23,16 @@ services:
       - TIMEOUT=120
       # ⚠️ 部署到海外机器无需代理，如果在国内云，取消注释并填入你的本机 http/socks 代理
       # - PROXY=http://host.docker.internal:7890
+
+      # ── FlareSolverr（CF 挑战自动绕过） ──
+      # 检测到 Cloudflare/Vercel 安全验证时自动调用 FlareSolverr 绕过
+      # FlareSolverr 需提前在宿主机运行: docker run -d -p 8191:8191 ghcr.io/flaresolverr/flaresolverr:latest
+      - FLARE_SOLVERR_URL=http://172.29.0.1:8191
+
+      # ── Puppeteer Chrome 路径 ──
+      # 不配置则使用 Puppeteer 自带的 Chromium（需下载）
+      # 配置后使用系统 Chrome（可以复用已有 cookies）
+      - CHROME_PATH=/usr/bin/chromium-browser
 
       # [可选环境变量] 以下变量如果声明，将会覆盖 config.yaml 中对应的配置：
       # - CURSOR_MODEL=anthropic/claude-sonnet-4.6

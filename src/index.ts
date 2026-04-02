@@ -15,6 +15,7 @@ import { serveLogViewer, apiGetLogs, apiGetRequests, apiGetStats, apiGetVueStats
 import { apiGetConfig, apiSaveConfig } from './config-api.js';
 import { loadLogsFromFiles } from './logger.js';
 import { initDb } from './logger-db.js';
+import { closeBrowser } from './puppeteer-client.js';
 
 // 从 package.json 读取版本号，统一来源，避免多处硬编码
 const require = createRequire(import.meta.url);
@@ -224,6 +225,7 @@ server.on('error', (err: NodeJS.ErrnoException) => {
 function gracefulShutdown(signal: string): void {
     console.log(`\n[Server] 收到 ${signal}，正在关闭连接...`);
     stopConfigWatcher();
+    closeBrowser().catch(() => {});
     server.close((closeErr) => {
         if (closeErr) console.error('[Server] close:', closeErr);
         process.exit(closeErr ? 1 : 0);

@@ -1,0 +1,133 @@
+{
+  "session_id": "BRS-stream-recovery-20260331",
+  "topic": "下游断流主动恢复机制：监控响应末尾缺失完成语义，主动发送 check/continue 补救",
+  "gc_round": 0,
+  "generated_ideas": [
+    { "id": "IDEA-1", "title": "语义锚点检测法（Semantic Anchor Detection）", "round": 0, "revised": false },
+    { "id": "IDEA-2", "title": "双层检测策略（Two-Layer Detection）", "round": 0, "revised": false },
+    { "id": "IDEA-3", "title": "check 与 continue 语义分层设计", "round": 0, "revised": false },
+    { "id": "IDEA-4", "title": "渐进式恢复时机（Progressive Recovery Timing）", "round": 0, "revised": false },
+    { "id": "IDEA-5", "title": "短回复白名单 + 最小语义密度阈值", "round": 0, "revised": false },
+    { "id": "IDEA-6", "title": "去重缓冲队列（Dedup Buffer Queue）", "round": 0, "revised": false },
+    { "id": "IDEA-7", "title": "分层恢复 vs 重试——独立状态机设计", "round": 0, "revised": false },
+    { "id": "IDEA-8", "title": "统一抽象层 + Handler 特化实现", "round": 0, "revised": false }
+  ],
+  "critique_insights": [
+    {
+      "idea": "IDEA-1",
+      "severity": "CRITICAL",
+      "key_challenge": "False positives: semantic anchor detection misclassifies normal completions as truncated. Normal prose/code responses do NOT end with explicit anchors ('done', closed blocks). 90% accuracy claim is unsubstantiated. Also duplicates existing isTruncated() in truncation-detector.ts.",
+      "round": 0
+    },
+    {
+      "idea": "IDEA-2",
+      "severity": "MEDIUM",
+      "key_challenge": "Layer 1 duplicates existing isTruncated(). DeepCheck (semantic analyzer) is unreliable and expensive. 80% pass-through target is unvalidated.",
+      "round": 0
+    },
+    {
+      "idea": "IDEA-3",
+      "severity": "HIGH",
+      "key_challenge": "No evidence Cursor API differentiates 'check' vs 'continue' at the protocol level. 'check' already exists in codebase as user message prefix + Proxy hint. The semantic distinction does not exist upstream.",
+      "round": 0
+    },
+    {
+      "idea": "IDEA-4",
+      "severity": "MEDIUM",
+      "key_challenge": "T1/T2/T3 timers duplicate existing idle timeout. 500ms silence after last SSE event is indistinguishable from normal completion. Short-reply skip creates false negatives that defeat the purpose.",
+      "round": 0
+    },
+    {
+      "idea": "IDEA-5",
+      "severity": "MEDIUM",
+      "key_challenge": "Dynamic prompt-pattern whitelist requires maintaining state across requests with cold-start and pattern drift problems. Semantic density threshold (0.5) is arbitrary. OR relationship between conditions creates security gaps.",
+      "round": 0
+    },
+    {
+      "idea": "IDEA-6",
+      "severity": "MEDIUM",
+      "key_challenge": "n-gram similarity dedup is expensive (O(n) per fragment). Simpler solution: enforce single-check retry policy via existing retry counter.",
+      "round": 0
+    },
+    {
+      "idea": "IDEA-7",
+      "severity": "MEDIUM",
+      "key_challenge": "Partially reinvents existing Retry (transport) vs Recovery (content) separation. Independence assumption may waste retry budget when content-layer failures repeat on immediate retry.",
+      "round": 0
+    },
+    {
+      "idea": "IDEA-8",
+      "severity": "MEDIUM",
+      "key_challenge": "YAGNI for 2 handlers. Formal interface may conflict with existing SSE fragment pipeline. Shared utilities would suffice at current scope.",
+      "round": 0
+    }
+  ],
+  "critique_summary": {
+    "critical_count": 1,
+    "high_count": 1,
+    "medium_count": 6,
+    "low_count": 0,
+    "gc_signal": "REVISION_NEEDED",
+    "primary_concern": "Ideas collectively overestimate novelty relative to existing truncation-detector.ts and retry machinery. IDEA-1 has CRITICAL false-positive risk. check/continue distinction is not supported by upstream evidence. Real gap is: normal stop_reason but premature-feeling content -- a harder problem all ideas understate.",
+    "recommended_priority": "IDEA-7 (formalize existing layer separation), IDEA-3 revision (align with existing probe/continuation), extend truncation-detector.ts for the remaining edge case"
+  },
+  "synthesis_themes": [
+    {
+      "name": "结构性截断已有覆盖，语义检测不可靠",
+      "strength": 10,
+      "supporting_ideas": ["IDEA-1部分", "IDEA-2部分"],
+      "resolution": "丢弃语义锚点思路，复用isTruncated() + stop_reason精确信号"
+    },
+    {
+      "name": "check/continue协议区分无上游证据",
+      "strength": 8,
+      "supporting_ideas": ["IDEA-3"],
+      "resolution": "废弃check/continue协议区分，复用现有probe机制(buildShortResponseRetryRequest)"
+    },
+    {
+      "name": "单次probe重试优于复杂去重缓冲",
+      "strength": 8,
+      "supporting_ideas": ["IDEA-6"],
+      "resolution": "严格retry计数控制，不做n-gram去重"
+    },
+    {
+      "name": "分层架构已有雏形，需形式化",
+      "strength": 7,
+      "supporting_ideas": ["IDEA-7"],
+      "resolution": "注释+变量命名明确Transport vs Content分层，共享retry预算池"
+    },
+    {
+      "name": "渐进式时机与idle timeout重叠",
+      "strength": 7,
+      "supporting_ideas": ["IDEA-4"],
+      "resolution": "不做新时机设计，在内容特征上判断(极短+非数字)"
+    }
+  ],
+  "synthesis_proposals": [
+    {
+      "id": "A",
+      "title": "扩展detectTruncation覆盖end_turn+感觉短场景",
+      "feasibility": 9,
+      "innovation": 5,
+      "key_benefits": ["零误判风险", "与现有probe机制兼容", "调用方改动最小"],
+      "remaining_risks": ["阈值需生产验证", "极短正常回复会被probe一次"]
+    },
+    {
+      "id": "B",
+      "title": "形式化Transport/Content分层状态机",
+      "feasibility": 9,
+      "innovation": 3,
+      "key_benefits": ["架构清晰", "调试友好", "共享retry预算"],
+      "remaining_risks": ["改动主要是注释整理"]
+    },
+    {
+      "id": "C",
+      "title": "最小化方案: end_turn+极短响应直接probe",
+      "feasibility": 10,
+      "innovation": 2,
+      "key_benefits": ["改动极小", "零新增机制", "复用retryCount"],
+      "remaining_risks": ["阈值需调优", "两处都要改保持一致"]
+    }
+  ],
+  "gc_round": 1
+}
